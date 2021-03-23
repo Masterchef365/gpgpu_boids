@@ -103,6 +103,8 @@ struct Engine {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
 
+    render_pass: vk::RenderPass,
+
     scene_data: MemObject<vk::Buffer>,
 
     boid_buf_a: MemObject<vk::Buffer>,
@@ -132,8 +134,6 @@ impl Engine {
 
         let (surface, hardware, surface_info, core) =
             windowed::basics(&app_info, &mut setup, &window)?;
-
-        let swapchain = Swapchain::new(core.clone(), &hardware, surface, &surface_info, vr)?;
 
         // Create command pool
         let create_info = vk::CommandPoolCreateInfoBuilder::new()
@@ -285,6 +285,9 @@ impl Engine {
 
         // Create render pass
         let render_pass = create_render_pass(&core, vr)?;
+
+        // Create swapchain
+        let swapchain = Swapchain::new(core.clone(), &hardware, surface, &surface_info, render_pass, vr)?;
 
         // Build scene pipeline
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfoBuilder::new()
@@ -442,6 +445,7 @@ impl Engine {
             scene_pipeline_layout,
             boid_pipeline_layout,
             boid_buf_select: false,
+            render_pass,
             vr,
         };
 
@@ -588,6 +592,7 @@ impl Engine {
                 &self.hardware,
                 self.surface,
                 &self.surface_info,
+                self.render_pass,
                 self.vr,
             )?;
             return Ok(());
@@ -709,6 +714,7 @@ struct Swapchain {
     image_views: Vec<vk::ImageView>,
     depth_image: MemObject<vk::Image>,
     depth_image_view: vk::ImageView,
+    framebuffers: Vec<vk::Framebuffer>,
     extent: vk::Extent2D,
     core: SharedCore,
 }
@@ -719,6 +725,7 @@ impl Swapchain {
         hardware: &HardwareSelection,
         surface: SurfaceKHR,
         surface_info: &SurfaceInfo,
+        render_pass: vk::RenderPass,
         vr: bool,
     ) -> Result<Self> {
         // Create swapchain
@@ -754,8 +761,7 @@ impl Swapchain {
             unsafe { core.device.create_swapchain_khr(&create_info, None, None) }.result()?;
 
         // Swapchain images
-        let images =
-            unsafe { core.device.get_swapchain_images_khr(swapchain, None) }.result()?;
+        let images = unsafe { core.device.get_swapchain_images_khr(swapchain, None) }.result()?;
 
         let image_views = images
             .iter()
@@ -821,6 +827,22 @@ impl Swapchain {
         let depth_image_view =
             unsafe { core.device.create_image_view(&create_info, None, None) }.result()?;
 
+        let framebuffers = image_views
+            .iter()
+            .map(|&image_view| -> Result<vk::Framebuffer> {
+                let attachments = [image_view, depth_image_view];
+                let create_info = vk::FramebufferCreateInfoBuilder::new()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(surface_caps.current_extent.width)
+                    .height(surface_caps.current_extent.height)
+                    .layers(1);
+
+                let framebuffer =
+                    unsafe { core.device.create_framebuffer(&create_info, None, None) }.result()?;
+                Ok(framebuffer)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             swapchain,
@@ -830,6 +852,7 @@ impl Swapchain {
             core,
             depth_image_view,
             depth_image,
+            framebuffers,
         })
     }
 }
@@ -841,9 +864,7 @@ impl Drop for Swapchain {
                 .device
                 .destroy_swapchain_khr(Some(self.swapchain), None);
             for view in self.image_views.drain(..) {
-            self.core
-                .device
-                .destroy_image_view(Some(view), None);
+                self.core.device.destroy_image_view(Some(view), None);
             }
         }
         self.depth_image.free(&self.core);
