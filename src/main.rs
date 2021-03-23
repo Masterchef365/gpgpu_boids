@@ -53,7 +53,7 @@ struct App {
 
 impl App {
     pub fn new(event_loop: &EventLoop<()>) -> Result<Self> {
-        let workgroups = 22;
+        let workgroups = 800;
         let engine = Engine::new(event_loop, false, workgroups)?;
         let camera = MouseArcBall::new(Default::default(), 0.001, 0.004);
 
@@ -816,10 +816,12 @@ impl Engine {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            self.core
+            let res = self.core
                 .device
-                .queue_present_khr(self.core.graphics_queue, &present_info)
-                .result()?;
+                .queue_present_khr(self.core.graphics_queue, &present_info);
+            if res.raw != vk::Result::ERROR_OUT_OF_DATE_KHR {
+                res.result()?;
+            }
         }
 
         self.boid_buf_select = !self.boid_buf_select;
