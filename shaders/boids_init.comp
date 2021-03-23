@@ -15,13 +15,13 @@ layout(std430, binding = 0) buffer Boids {
 const float spread = 10.0;
 
 float rand(vec2 co){
-    return fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43758.5453);
+    return fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43.5453);
 }
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= boids.length()) return;
-    float seed = gid;
+    float seed = gid + 5.;
     boids[gid].pos = vec3(
         rand(vec2(seed, 342.)) * spread,
         rand(vec2(seed, 432.)) * spread,

@@ -67,7 +67,7 @@ impl App {
     pub fn event(&mut self, event: WindowEvent) -> Result<()> {
         // Camera stuff
         self.camera.handle_events(&event);
-        let extent = self.engine.swapchain.extent;
+        let extent = self.engine.swapchain.as_ref().unwrap().extent;
         let mut data = [0.0; 32];
         data.iter_mut()
             .zip(
@@ -130,9 +130,12 @@ struct Engine {
     boid_pipeline: vk::Pipeline,
     boid_init_pipeline: vk::Pipeline,
 
+    boid_descriptor_set_layout: vk::DescriptorSetLayout, 
+    scene_descriptor_set_layout: vk::DescriptorSetLayout,
+
     surface_info: SurfaceInfo,
     surface: SurfaceKHR,
-    swapchain: Swapchain,
+    swapchain: Option<Swapchain>,
 
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
@@ -475,7 +478,7 @@ impl Engine {
             descriptor_pool,
             boid_desc_set,
             scene_desc_set,
-            swapchain,
+            swapchain: Some(swapchain),
             image_available,
             render_finished,
             boid_pipeline,
@@ -490,6 +493,8 @@ impl Engine {
             boid_buf_select: false,
             render_pass,
             frame: 0,
+            boid_descriptor_set_layout,
+            scene_descriptor_set_layout,
             vr,
         };
 
@@ -639,9 +644,10 @@ impl Engine {
 
         // Get the index of the next swapchain image,
         // and set up a semaphore to be notified when it is ready.
+        let swapchain = self.swapchain.as_ref().unwrap();
         let swap_image_index = unsafe {
             self.core.device.acquire_next_image_khr(
-                self.swapchain.swapchain,
+                swapchain.swapchain,
                 u64::MAX,
                 Some(self.image_available),
                 None,
@@ -651,20 +657,21 @@ impl Engine {
 
         // Early return and invalidate swapchain
         let image_index = if swap_image_index.raw == vk::Result::ERROR_OUT_OF_DATE_KHR {
-            self.swapchain = Swapchain::new(
+            self.swapchain = Some(Swapchain::new(
                 self.core.clone(),
                 &self.hardware,
                 self.surface,
                 &self.surface_info,
                 self.render_pass,
                 self.vr,
-            )?;
+            )?);
             return Ok(());
         } else {
             swap_image_index.unwrap() as usize
         };
 
-        let framebuffer = self.swapchain.framebuffers[image_index];
+        let extent = swapchain.extent;
+        let framebuffer = swapchain.framebuffers[image_index];
 
         // Update descriptor set to include the buffer
         self.write_boid_desc_set()?;
@@ -745,7 +752,7 @@ impl Engine {
                 .render_pass(self.render_pass)
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.swapchain.extent,
+                    extent,
                 })
                 .clear_values(&clear_values);
 
@@ -759,14 +766,14 @@ impl Engine {
             let viewports = [vk::ViewportBuilder::new()
                 .x(0.0)
                 .y(0.0)
-                .width(self.swapchain.extent.width as f32)
-                .height(self.swapchain.extent.height as f32)
+                .width(extent.width as f32)
+                .height(extent.height as f32)
                 .min_depth(0.0)
                 .max_depth(1.0)];
 
             let scissors = [vk::Rect2DBuilder::new()
                 .offset(vk::Offset2D { x: 0, y: 0 })
-                .extent(self.swapchain.extent)];
+                .extent(extent)];
 
             self.core
                 .device
@@ -819,7 +826,7 @@ impl Engine {
                 .queue_submit(self.core.graphics_queue, &[submit_info], None)
                 .result()?;
 
-            let swapchains = [self.swapchain.swapchain];
+            let swapchains = [swapchain.swapchain];
             let image_indices = [image_index as u32];
             let present_info = khr_swapchain::PresentInfoKHRBuilder::new()
                 .wait_semaphores(&signal_semaphores)
@@ -843,7 +850,42 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        todo!("Dealloc")
+        unsafe {
+            self.core.device.queue_wait_idle(self.core.graphics_queue).unwrap();
+            self.boid_buf_a.free(&self.core);
+            self.boid_buf_b.free(&self.core);
+            self.scene_data.free(&self.core);
+            self.core
+                .device
+                .destroy_command_pool(Some(self.command_pool), None);
+            self.core
+                .device
+                .destroy_semaphore(Some(self.image_available), None);
+            self.core
+                .device
+                .destroy_semaphore(Some(self.render_finished), None);
+            self.core.device.destroy_render_pass(Some(self.render_pass), None);
+            for &pipe in &[self.scene_pipeline, self.boid_pipeline, self.boid_init_pipeline] {
+                self.core
+                    .device
+                    .destroy_pipeline(Some(pipe), None);
+                }
+            for &lay in &[self.scene_pipeline_layout, self.boid_pipeline_layout] {
+                self.core
+                    .device
+                    .destroy_pipeline_layout(Some(lay), None);
+            }
+            for &desc in &[self.scene_descriptor_set_layout, self.boid_descriptor_set_layout] {
+                self.core
+                    .device
+                    .destroy_descriptor_set_layout(Some(desc), None);
+                }
+            self.core
+                .device
+                .destroy_descriptor_pool(Some(self.descriptor_pool), None);
+            drop(self.swapchain.take());
+            self.core.device.destroy_device(None);
+        }
     }
 }
 
@@ -918,7 +960,6 @@ fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
 
 struct Swapchain {
     swapchain: SwapchainKHR,
-    images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     depth_image: MemObject<vk::Image>,
     depth_image_view: vk::ImageView,
@@ -1054,7 +1095,6 @@ impl Swapchain {
 
         Ok(Self {
             swapchain,
-            images,
             extent: surface_caps.current_extent,
             image_views,
             core,
@@ -1072,6 +1112,10 @@ impl Drop for Swapchain {
             self.core
                 .device
                 .destroy_swapchain_khr(Some(self.swapchain), None);
+            for buf in self.framebuffers.drain(..) {
+                self.core.device.destroy_framebuffer(Some(buf), None);
+            }
+            self.core.device.destroy_image_view(Some(self.depth_image_view), None);
             for view in self.image_views.drain(..) {
                 self.core.device.destroy_image_view(Some(view), None);
             }
