@@ -1,0 +1,15 @@
+[package]
+name = "le_fishe"
+version = "0.1.0"
+authors = ["Masterchef365 <duncan.freeman1@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+erupt = "0.17"
+anyhow = "1"
+wibaeowibtnr = { path = "../wibaeowibtnr" }
+gpu-alloc-erupt = "0.3"
+gpu-alloc = "0.3"
+rand = "0.8"
+bytemuck = "1.3"
+winit = "0.22"
