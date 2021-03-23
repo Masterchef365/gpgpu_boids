@@ -16,7 +16,7 @@ use std::ffi::CString;
 use wibaeowibtnr as klystron;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
-    event::{self, Event, WindowEvent},
+    event::{self, Event, WindowEvent, KeyboardInput, VirtualKeyCode, ElementState},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
@@ -65,6 +65,7 @@ impl App {
     }
 
     pub fn event(&mut self, event: WindowEvent) -> Result<()> {
+        // Camera stuff
         self.camera.handle_events(&event);
         let extent = self.engine.swapchain.extent;
         let mut data = [0.0; 32];
@@ -78,6 +79,15 @@ impl App {
             )
             .for_each(|(o, i)| *o = *i);
         self.cam_matrix = data;
+
+        if let WindowEvent::KeyboardInput { input: KeyboardInput { virtual_keycode: Some(key), state, .. }, ..} = event {
+            match key {
+                VirtualKeyCode::Space => if state == ElementState::Released {
+                    self.engine.reset_boids()?;
+                },
+                _ => (),
+            }
+        }
 
         Ok(())
     }
@@ -1058,6 +1068,7 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         unsafe {
+            self.core.device.queue_wait_idle(self.core.graphics_queue).unwrap();
             self.core
                 .device
                 .destroy_swapchain_khr(Some(self.swapchain), None);

@@ -26,7 +26,7 @@ void main() {
         rand(vec2(seed, 342.)) * spread,
         rand(vec2(seed, 432.)) * spread,
         rand(vec2(seed, 121.)) * spread
-    );
+    ) * 2. - 1.;
     boids[gid].heading = vec3(
         rand(vec2(seed, 34.)),
         rand(vec2(seed, 45.)),
