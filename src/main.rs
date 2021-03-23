@@ -10,13 +10,12 @@ use gpu_alloc_erupt::EruptMemoryDevice;
 use klystron::{
     mem_objects::MemObject,
     windowed::{self, hardware::SurfaceInfo},
-    ApplicationInfo, Core, HardwareSelection, Memory, SharedCore, VulkanSetup,
+    ApplicationInfo, Core, HardwareSelection, SharedCore, VulkanSetup,
 };
 use std::ffi::CString;
 use wibaeowibtnr as klystron;
 use winit::{
-    dpi::{PhysicalPosition, PhysicalSize},
-    event::{self, Event, WindowEvent, KeyboardInput, VirtualKeyCode, ElementState},
+    event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
@@ -80,11 +79,22 @@ impl App {
             .for_each(|(o, i)| *o = *i);
         self.cam_matrix = data;
 
-        if let WindowEvent::KeyboardInput { input: KeyboardInput { virtual_keycode: Some(key), state, .. }, ..} = event {
-            match key {
-                VirtualKeyCode::Space => if state == ElementState::Released {
-                    self.engine.reset_boids()?;
+        if let WindowEvent::KeyboardInput {
+            input:
+                KeyboardInput {
+                    virtual_keycode: Some(key),
+                    state,
+                    ..
                 },
+            ..
+        } = event
+        {
+            match key {
+                VirtualKeyCode::Space => {
+                    if state == ElementState::Released {
+                        self.engine.reset_boids()?;
+                    }
+                }
                 _ => (),
             }
         }
@@ -113,7 +123,7 @@ unsafe impl bytemuck::Pod for SceneData {}
 unsafe impl bytemuck::Zeroable for SceneData {}
 
 struct Engine {
-    window: Window,
+    _window: Window,
     hardware: HardwareSelection,
 
     command_buffer: vk::CommandBuffer,
@@ -130,7 +140,7 @@ struct Engine {
     boid_pipeline: vk::Pipeline,
     boid_init_pipeline: vk::Pipeline,
 
-    boid_descriptor_set_layout: vk::DescriptorSetLayout, 
+    boid_descriptor_set_layout: vk::DescriptorSetLayout,
     scene_descriptor_set_layout: vk::DescriptorSetLayout,
 
     surface_info: SurfaceInfo,
@@ -469,7 +479,7 @@ impl Engine {
 
         let mut instance = Self {
             core,
-            window,
+            _window: window,
             surface,
             hardware,
             surface_info,
@@ -729,7 +739,6 @@ impl Engine {
                 &[],
             );
 
-
             // ############################# GRAPHICS #############################
 
             // Set render pass
@@ -833,7 +842,8 @@ impl Engine {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            let res = self.core
+            let res = self
+                .core
                 .device
                 .queue_present_khr(self.core.graphics_queue, &present_info);
             if res.raw != vk::Result::ERROR_OUT_OF_DATE_KHR {
@@ -851,7 +861,10 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
-            self.core.device.queue_wait_idle(self.core.graphics_queue).unwrap();
+            self.core
+                .device
+                .queue_wait_idle(self.core.graphics_queue)
+                .unwrap();
             self.boid_buf_a.free(&self.core);
             self.boid_buf_b.free(&self.core);
             self.scene_data.free(&self.core);
@@ -864,22 +877,27 @@ impl Drop for Engine {
             self.core
                 .device
                 .destroy_semaphore(Some(self.render_finished), None);
-            self.core.device.destroy_render_pass(Some(self.render_pass), None);
-            for &pipe in &[self.scene_pipeline, self.boid_pipeline, self.boid_init_pipeline] {
-                self.core
-                    .device
-                    .destroy_pipeline(Some(pipe), None);
-                }
-            for &lay in &[self.scene_pipeline_layout, self.boid_pipeline_layout] {
-                self.core
-                    .device
-                    .destroy_pipeline_layout(Some(lay), None);
+            self.core
+                .device
+                .destroy_render_pass(Some(self.render_pass), None);
+            for &pipe in &[
+                self.scene_pipeline,
+                self.boid_pipeline,
+                self.boid_init_pipeline,
+            ] {
+                self.core.device.destroy_pipeline(Some(pipe), None);
             }
-            for &desc in &[self.scene_descriptor_set_layout, self.boid_descriptor_set_layout] {
+            for &lay in &[self.scene_pipeline_layout, self.boid_pipeline_layout] {
+                self.core.device.destroy_pipeline_layout(Some(lay), None);
+            }
+            for &desc in &[
+                self.scene_descriptor_set_layout,
+                self.boid_descriptor_set_layout,
+            ] {
                 self.core
                     .device
                     .destroy_descriptor_set_layout(Some(desc), None);
-                }
+            }
             self.core
                 .device
                 .destroy_descriptor_pool(Some(self.descriptor_pool), None);
@@ -1108,14 +1126,19 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         unsafe {
-            self.core.device.queue_wait_idle(self.core.graphics_queue).unwrap();
+            self.core
+                .device
+                .queue_wait_idle(self.core.graphics_queue)
+                .unwrap();
             self.core
                 .device
                 .destroy_swapchain_khr(Some(self.swapchain), None);
             for buf in self.framebuffers.drain(..) {
                 self.core.device.destroy_framebuffer(Some(buf), None);
             }
-            self.core.device.destroy_image_view(Some(self.depth_image_view), None);
+            self.core
+                .device
+                .destroy_image_view(Some(self.depth_image_view), None);
             for view in self.image_views.drain(..) {
                 self.core.device.destroy_image_view(Some(view), None);
             }
