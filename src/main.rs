@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use erupt::extensions::{
     khr_surface::{self, SurfaceKHR},
     khr_swapchain::{self, SwapchainKHR},
 };
+use erupt::utils::decode_spv;
 use erupt::vk;
 use klystron::{
     mem_objects::MemObject,
@@ -16,6 +17,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use std::ffi::CString;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new();
@@ -77,13 +79,16 @@ struct Engine {
     //boid_buf_b: MemObject<vk::Buffer>,
     //boid_buf_select: bool,
 
+    //scene_pipeline: vk::Pipeline,
+    boid_pipeline: vk::Pipeline,
+
     swapchain: SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     surface_info: SurfaceInfo,
     surface: SurfaceKHR,
 
-    //image_available: vk::Semaphore,
-    //render_finished: vk::Semaphore,
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore,
 
     core: SharedCore,
 }
@@ -140,7 +145,7 @@ impl Engine {
 
         let create_info = vk::DescriptorSetLayoutCreateInfoBuilder::new().bindings(&bindings);
 
-        let boids_descriptor_set_layout = unsafe {
+        let boid_descriptor_set_layout = unsafe {
             core.device
                 .create_descriptor_set_layout(&create_info, None, None)
         }
@@ -184,7 +189,7 @@ impl Engine {
             unsafe { core.device.create_descriptor_pool(&create_info, None, None) }.result()?;
 
         // Sets
-        let descriptor_set_layouts = [boids_descriptor_set_layout, scene_descriptor_set_layout];
+        let descriptor_set_layouts = [boid_descriptor_set_layout, scene_descriptor_set_layout];
         let create_info = vk::DescriptorSetAllocateInfoBuilder::new()
             .descriptor_pool(descriptor_pool)
             .set_layouts(&descriptor_set_layouts);
@@ -194,6 +199,60 @@ impl Engine {
 
         let boid_desc_set = descriptor_sets[0];
         let scene_desc_set = descriptor_sets[1];
+        
+        // Whether or not the frame at this index is available (gpu-only)
+        let create_info = vk::SemaphoreCreateInfoBuilder::new();
+        let image_available =
+            unsafe { core.device.create_semaphore(&create_info, None, None) }.result()?;
+
+        // Whether or not the frame at this index is finished rendering (gpu-only)
+        let render_finished =
+            unsafe { core.device.create_semaphore(&create_info, None, None) }.result()?;
+
+        // Load shader source
+        let load_shader_module = |name: &str| -> Result<vk::ShaderModule> {
+            let shader_spirv = std::fs::read(name).with_context(|| format!("Shader \"{}\" failed to load", name))?;
+            let shader_decoded = decode_spv(&shader_spirv).context("Shader decode failed")?;
+            let create_info = vk::ShaderModuleCreateInfoBuilder::new().code(&shader_decoded);
+            Ok(unsafe { core.device.create_shader_module(&create_info, None, None) }.result()?)
+        };
+
+        let boid_module = load_shader_module("./shaders/boids.comp.spv")?;
+        let vertex_module = load_shader_module("./shaders/unlit.vert.spv")?;
+        let fragment_module = load_shader_module("./shaders/unlit.frag.spv")?;
+
+        // Build boid pipeline
+        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
+            .set_layouts(&descriptor_set_layouts);
+        let pipeline_layout =
+            unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
+
+        let main_entry_point = CString::new("main")?;
+        let stage = vk::PipelineShaderStageCreateInfoBuilder::new()
+            .stage(vk::ShaderStageFlagBits::COMPUTE)
+            .module(boid_module)
+            .name(&main_entry_point)
+            .build();
+        let boid_create_info = vk::ComputePipelineCreateInfoBuilder::new()
+            .stage(stage)
+            .layout(pipeline_layout);
+
+        let pipelines = unsafe {
+            core.device.create_compute_pipelines(
+                None,
+                &[boid_create_info],
+                None,
+            )
+        }
+        .result()?;
+
+        let boid_pipeline = pipelines[0];
+
+        unsafe {
+            for &m in &[boid_module, vertex_module, fragment_module] {
+                core.device.destroy_shader_module(Some(m), None);
+            }
+        }
 
         Ok(Self {
             core,
@@ -208,6 +267,9 @@ impl Engine {
             scene_desc_set,
             swapchain,
             swapchain_images,
+            image_available,
+            render_finished,
+            boid_pipeline,
         })
     }
 }
