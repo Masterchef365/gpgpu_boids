@@ -6,6 +6,7 @@ use erupt::extensions::{
 use erupt::utils::decode_spv;
 use erupt::vk;
 use gpu_alloc::UsageFlags;
+use gpu_alloc_erupt::EruptMemoryDevice;
 use klystron::{
     mem_objects::MemObject,
     windowed::{self, hardware::SurfaceInfo},
@@ -19,6 +20,8 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+mod camera;
+use camera::MouseArcBall;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new();
@@ -44,22 +47,44 @@ fn main() -> Result<()> {
 
 struct App {
     engine: Engine,
+    camera: MouseArcBall,
+    cam_matrix: [f32; 32],
 }
 
 impl App {
     pub fn new(event_loop: &EventLoop<()>) -> Result<Self> {
         let workgroups = 22;
         let engine = Engine::new(event_loop, false, workgroups)?;
+        let camera = MouseArcBall::new(Default::default(), 0.001, 0.004);
 
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            camera,
+            cam_matrix: [0.; 32],
+        })
     }
 
     pub fn event(&mut self, event: WindowEvent) -> Result<()> {
+        self.camera.handle_events(&event);
+        let extent = self.engine.swapchain.extent;
+        let mut data = [0.0; 32];
+        data.iter_mut()
+            .zip(
+                self.camera
+                    .inner
+                    .matrix(extent.width, extent.height)
+                    .as_slice()
+                    .iter(),
+            )
+            .for_each(|(o, i)| *o = *i);
+        self.cam_matrix = data;
+
         Ok(())
     }
 
     pub fn draw(&mut self) -> Result<()> {
-        self.engine.draw()
+        let extent = self.engine.swapchain.extent;
+        self.engine.draw(self.cam_matrix)
     }
 }
 
@@ -71,7 +96,7 @@ const BOID_SIZE: u32 = 4 * (3 + 1 + 3 + 1);
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SceneData {
-    pub cameras: [[[f32; 4]; 4]; 2],
+    pub cameras: [f32; 32],
     pub frame: u32,
 }
 
@@ -113,6 +138,8 @@ struct Engine {
 
     workgroups: u32,
     vr: bool,
+
+    frame: u32,
 
     core: SharedCore,
 }
@@ -287,7 +314,14 @@ impl Engine {
         let render_pass = create_render_pass(&core, vr)?;
 
         // Create swapchain
-        let swapchain = Swapchain::new(core.clone(), &hardware, surface, &surface_info, render_pass, vr)?;
+        let swapchain = Swapchain::new(
+            core.clone(),
+            &hardware,
+            surface,
+            &surface_info,
+            render_pass,
+            vr,
+        )?;
 
         // Build scene pipeline
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfoBuilder::new()
@@ -446,6 +480,7 @@ impl Engine {
             boid_pipeline_layout,
             boid_buf_select: false,
             render_pass,
+            frame: 0,
             vr,
         };
 
@@ -572,10 +607,28 @@ impl Engine {
         Ok(())
     }
 
-    pub fn draw(&mut self) -> Result<()> {
+    pub fn draw(&mut self, camera_matrices: [f32; 32]) -> Result<()> {
+        // TODO: Real sync!
+        unsafe {
+            self.core
+                .device
+                .queue_wait_idle(self.core.graphics_queue)
+                .result()?;
+            }
+
+        let data = SceneData {
+            cameras: camera_matrices,
+            frame: self.frame,
+        };
+        unsafe {
+            let device = EruptMemoryDevice::wrap(&self.core.device);
+            self.scene_data.memory_mut().write_bytes(device, 0, bytemuck::cast_slice(&[data]))?;
+        }
+
+
         // Get the index of the next swapchain image,
         // and set up a semaphore to be notified when it is ready.
-        let image_index = unsafe {
+        let swap_image_index = unsafe {
             self.core.device.acquire_next_image_khr(
                 self.swapchain.swapchain,
                 u64::MAX,
@@ -586,7 +639,7 @@ impl Engine {
         };
 
         // Early return and invalidate swapchain
-        let image_index = if image_index.raw == vk::Result::ERROR_OUT_OF_DATE_KHR {
+        let image_index = if swap_image_index.raw == vk::Result::ERROR_OUT_OF_DATE_KHR {
             self.swapchain = Swapchain::new(
                 self.core.clone(),
                 &self.hardware,
@@ -597,16 +650,18 @@ impl Engine {
             )?;
             return Ok(());
         } else {
-            image_index.unwrap()
+            swap_image_index.unwrap() as usize
         };
 
-        let swapchain_image = self.swapchain.images[image_index as usize];
+        let swapchain_image = self.swapchain.images[image_index];
+        let framebuffer = self.swapchain.framebuffers[image_index];
 
         // Update descriptor set to include the buffer
         self.write_boid_desc_set()?;
         self.write_scene_desc_set()?;
 
         unsafe {
+            // Reset and begin
             self.core
                 .device
                 .reset_command_buffer(self.command_buffer, None)
@@ -617,6 +672,105 @@ impl Engine {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .result()?;
 
+            // ############################# BOIDS #############################
+
+            self.core.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.boid_pipeline_layout,
+                0,
+                &[self.boid_desc_set],
+                &[],
+            );
+
+            // Radiation pipeline
+            self.core.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.boid_pipeline,
+            );
+
+            self.core
+                .device
+                .cmd_dispatch(self.command_buffer, BOID_LOCAL_X, 1, 1);
+
+            // ############################# GRAPHICS #############################
+
+            // Set render pass
+            let clear_values = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+            ];
+
+            let begin_info = vk::RenderPassBeginInfoBuilder::new()
+                .framebuffer(framebuffer)
+                .render_pass(self.render_pass)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain.extent,
+                })
+                .clear_values(&clear_values);
+
+            self.core.device.cmd_begin_render_pass(
+                self.command_buffer,
+                &begin_info,
+                vk::SubpassContents::INLINE,
+            );
+
+            // Scissor
+            let viewports = [vk::ViewportBuilder::new()
+                .x(0.0)
+                .y(0.0)
+                .width(self.swapchain.extent.width as f32)
+                .height(self.swapchain.extent.height as f32)
+                .min_depth(0.0)
+                .max_depth(1.0)];
+
+            let scissors = [vk::Rect2DBuilder::new()
+                .offset(vk::Offset2D { x: 0, y: 0 })
+                .extent(self.swapchain.extent)];
+
+            self.core
+                .device
+                .cmd_set_viewport(self.command_buffer, 0, &viewports);
+
+            self.core
+                .device
+                .cmd_set_scissor(self.command_buffer, 0, &scissors);
+
+            // Graphics pipeline
+            self.core.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.scene_pipeline_layout,
+                0,
+                &[self.scene_desc_set],
+                &[],
+            );
+
+            self.core.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.scene_pipeline,
+            );
+
+            let n_boids = self.workgroups * BOID_LOCAL_X;
+            self.core
+                .device
+                .cmd_draw(self.command_buffer, n_boids * 2, 1, 0, 0);
+
+            self.core.device.cmd_end_render_pass(self.command_buffer);
+
+            // End and submit
             self.core
                 .device
                 .end_command_buffer(self.command_buffer)
@@ -627,7 +781,35 @@ impl Engine {
                 .device
                 .queue_submit(self.core.graphics_queue, &[submit_info], None)
                 .result()?;
+
+            // Present
+            let wait_semaphores = [self.image_available];
+            let command_buffers = [self.command_buffer];
+            let signal_semaphores = [self.render_finished];
+            let submit_info = vk::SubmitInfoBuilder::new()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&[vk::PipelineStageFlags::ALL_GRAPHICS])
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.core
+                .device
+                .queue_submit(self.core.graphics_queue, &[submit_info], None)
+                .result()?;
+
+            let swapchains = [self.swapchain.swapchain];
+            let image_indices = [image_index as u32];
+            let present_info = khr_swapchain::PresentInfoKHRBuilder::new()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+
+            self.core
+                .device
+                .queue_present_khr(self.core.graphics_queue, &present_info)
+                .result()?;
         }
+
+        self.frame += 1;
 
         Ok(())
     }
