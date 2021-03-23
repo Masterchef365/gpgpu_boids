@@ -96,11 +96,9 @@ struct Engine {
     boid_pipeline: vk::Pipeline,
     boid_init_pipeline: vk::Pipeline,
 
-    swapchain: SwapchainKHR,
-    swapchain_images: Vec<vk::Image>,
     surface_info: SurfaceInfo,
     surface: SurfaceKHR,
-    extent: vk::Extent2D,
+    swapchain: Swapchain,
 
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
@@ -111,10 +109,8 @@ struct Engine {
     boid_buf_b: MemObject<vk::Buffer>,
     boid_buf_select: bool,
 
-    depth_image: MemObject<vk::Image>,
-    depth_image_view: vk::ImageView,
-
     workgroups: u32,
+    vr: bool,
 
     core: SharedCore,
 }
@@ -137,8 +133,7 @@ impl Engine {
         let (surface, hardware, surface_info, core) =
             windowed::basics(&app_info, &mut setup, &window)?;
 
-        let (swapchain, swapchain_images, extent) =
-            build_swapchain(&core, &hardware, surface, &surface_info)?;
+        let swapchain = Swapchain::new(core.clone(), &hardware, surface, &surface_info, vr)?;
 
         // Create command pool
         let create_info = vk::CommandPoolCreateInfoBuilder::new()
@@ -423,44 +418,6 @@ impl Engine {
             UsageFlags::UPLOAD | UsageFlags::HOST_ACCESS,
         )?;
 
-        // Create depth image
-        let layers = if vr { 2 } else { 1 };
-        let create_info = vk::ImageCreateInfoBuilder::new()
-            .image_type(vk::ImageType::_2D)
-            .extent(
-                vk::Extent3DBuilder::new()
-                    .width(extent.width)
-                    .height(extent.height)
-                    .depth(1)
-                    .build(),
-            )
-            .mip_levels(1)
-            .array_layers(layers)
-            .format(DEPTH_FORMAT)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .samples(vk::SampleCountFlagBits::_1)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-
-        let depth_image = MemObject::<vk::Image>::new(&core, create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
-
-        let create_info = vk::ImageViewCreateInfoBuilder::new()
-            .image(depth_image.instance)
-            .view_type(vk::ImageViewType::_2D)
-            .format(DEPTH_FORMAT)
-            .subresource_range(
-                vk::ImageSubresourceRangeBuilder::new()
-                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(layers)
-                    .build(),
-            );
-        let depth_image_view =
-            unsafe { core.device.create_image_view(&create_info, None, None) }.result()?;
-
         let mut instance = Self {
             core,
             window,
@@ -473,7 +430,6 @@ impl Engine {
             boid_desc_set,
             scene_desc_set,
             swapchain,
-            swapchain_images,
             image_available,
             render_finished,
             boid_pipeline,
@@ -486,9 +442,7 @@ impl Engine {
             scene_pipeline_layout,
             boid_pipeline_layout,
             boid_buf_select: false,
-            extent,
-            depth_image,
-            depth_image_view,
+            vr,
         };
 
         instance.reset_boids()?;
@@ -562,7 +516,10 @@ impl Engine {
 
     pub fn reset_boids(&mut self) -> Result<()> {
         unsafe {
-            self.core.device.queue_wait_idle(self.core.graphics_queue).result()?;
+            self.core
+                .device
+                .queue_wait_idle(self.core.graphics_queue)
+                .result()?;
             self.write_boid_desc_set()?;
             self.core
                 .device
@@ -616,7 +573,7 @@ impl Engine {
         // and set up a semaphore to be notified when it is ready.
         let image_index = unsafe {
             self.core.device.acquire_next_image_khr(
-                self.swapchain,
+                self.swapchain.swapchain,
                 u64::MAX,
                 Some(self.image_available),
                 None,
@@ -626,22 +583,19 @@ impl Engine {
 
         // Early return and invalidate swapchain
         let image_index = if image_index.raw == vk::Result::ERROR_OUT_OF_DATE_KHR {
-            unsafe {
-                self.core
-                    .device
-                    .destroy_swapchain_khr(Some(self.swapchain), None);
-            }
-            let (swapchain, swapchain_images, extent) =
-                build_swapchain(&self.core, &self.hardware, self.surface, &self.surface_info)?;
-            self.swapchain = swapchain;
-            self.swapchain_images = swapchain_images;
-            self.extent = extent;
+            self.swapchain = Swapchain::new(
+                self.core.clone(),
+                &self.hardware,
+                self.surface,
+                &self.surface_info,
+                self.vr,
+            )?;
             return Ok(());
         } else {
             image_index.unwrap()
         };
 
-        let swapchain_image = self.swapchain_images[image_index as usize];
+        let swapchain_image = self.swapchain.images[image_index as usize];
 
         // Update descriptor set to include the buffer
         self.write_boid_desc_set()?;
@@ -678,49 +632,6 @@ impl Drop for Engine {
     fn drop(&mut self) {
         todo!("Dealloc")
     }
-}
-
-fn build_swapchain(
-    core: &Core,
-    hardware: &HardwareSelection,
-    surface: SurfaceKHR,
-    surface_info: &SurfaceInfo,
-) -> Result<(SwapchainKHR, Vec<vk::Image>, vk::Extent2D)> {
-    // Create swapchain
-    let surface_caps = unsafe {
-        core.instance.get_physical_device_surface_capabilities_khr(
-            hardware.physical_device,
-            surface,
-            None,
-        )
-    }
-    .result()?;
-    let mut image_count = surface_caps.min_image_count + 1;
-    if surface_caps.max_image_count > 0 && image_count > surface_caps.max_image_count {
-        image_count = surface_caps.max_image_count;
-    }
-
-    let create_info = khr_swapchain::SwapchainCreateInfoKHRBuilder::new()
-        .surface(surface)
-        .min_image_count(image_count)
-        .image_format(windowed::COLOR_FORMAT)
-        .image_color_space(windowed::COLOR_SPACE)
-        .image_extent(surface_caps.current_extent)
-        .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT)
-        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .pre_transform(surface_caps.current_transform)
-        .composite_alpha(khr_surface::CompositeAlphaFlagBitsKHR::OPAQUE_KHR)
-        .present_mode(surface_info.present_mode)
-        .clipped(true)
-        .old_swapchain(khr_swapchain::SwapchainKHR::null());
-
-    let swapchain =
-        unsafe { core.device.create_swapchain_khr(&create_info, None, None) }.result()?;
-    let swapchain_images =
-        unsafe { core.device.get_swapchain_images_khr(swapchain, None) }.result()?;
-
-    Ok((swapchain, swapchain_images, surface_caps.current_extent))
 }
 
 fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
@@ -790,4 +701,151 @@ fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
     create_info.p_next = &mut multiview as *mut _ as _;
 
     Ok(unsafe { device.create_render_pass(&create_info, None, None) }.result()?)
+}
+
+struct Swapchain {
+    swapchain: SwapchainKHR,
+    images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
+    depth_image: MemObject<vk::Image>,
+    depth_image_view: vk::ImageView,
+    extent: vk::Extent2D,
+    core: SharedCore,
+}
+
+impl Swapchain {
+    pub fn new(
+        core: SharedCore,
+        hardware: &HardwareSelection,
+        surface: SurfaceKHR,
+        surface_info: &SurfaceInfo,
+        vr: bool,
+    ) -> Result<Self> {
+        // Create swapchain
+        let surface_caps = unsafe {
+            core.instance.get_physical_device_surface_capabilities_khr(
+                hardware.physical_device,
+                surface,
+                None,
+            )
+        }
+        .result()?;
+        let mut image_count = surface_caps.min_image_count + 1;
+        if surface_caps.max_image_count > 0 && image_count > surface_caps.max_image_count {
+            image_count = surface_caps.max_image_count;
+        }
+
+        let create_info = khr_swapchain::SwapchainCreateInfoKHRBuilder::new()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(windowed::COLOR_FORMAT)
+            .image_color_space(windowed::COLOR_SPACE)
+            .image_extent(surface_caps.current_extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(surface_caps.current_transform)
+            .composite_alpha(khr_surface::CompositeAlphaFlagBitsKHR::OPAQUE_KHR)
+            .present_mode(surface_info.present_mode)
+            .clipped(true)
+            .old_swapchain(khr_swapchain::SwapchainKHR::null());
+
+        let swapchain =
+            unsafe { core.device.create_swapchain_khr(&create_info, None, None) }.result()?;
+
+        // Swapchain images
+        let images =
+            unsafe { core.device.get_swapchain_images_khr(swapchain, None) }.result()?;
+
+        let image_views = images
+            .iter()
+            .map(|image| -> Result<vk::ImageView> {
+                let create_info = vk::ImageViewCreateInfoBuilder::new()
+                    .image(*image)
+                    .view_type(vk::ImageViewType::_2D)
+                    .format(COLOR_FORMAT)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::IDENTITY,
+                        g: vk::ComponentSwizzle::IDENTITY,
+                        b: vk::ComponentSwizzle::IDENTITY,
+                        a: vk::ComponentSwizzle::IDENTITY,
+                    })
+                    .subresource_range(
+                        vk::ImageSubresourceRangeBuilder::new()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(if vr { 2 } else { 1 })
+                            .build(),
+                    );
+                Ok(unsafe { core.device.create_image_view(&create_info, None, None) }.result()?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Depth image
+        let layers = if vr { 2 } else { 1 };
+        let create_info = vk::ImageCreateInfoBuilder::new()
+            .image_type(vk::ImageType::_2D)
+            .extent(
+                vk::Extent3DBuilder::new()
+                    .width(surface_caps.current_extent.width)
+                    .height(surface_caps.current_extent.height)
+                    .depth(1)
+                    .build(),
+            )
+            .mip_levels(1)
+            .array_layers(layers)
+            .format(DEPTH_FORMAT)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .samples(vk::SampleCountFlagBits::_1)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let depth_image =
+            MemObject::<vk::Image>::new(&core, create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
+
+        let create_info = vk::ImageViewCreateInfoBuilder::new()
+            .image(depth_image.instance)
+            .view_type(vk::ImageViewType::_2D)
+            .format(DEPTH_FORMAT)
+            .subresource_range(
+                vk::ImageSubresourceRangeBuilder::new()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(layers)
+                    .build(),
+            );
+        let depth_image_view =
+            unsafe { core.device.create_image_view(&create_info, None, None) }.result()?;
+
+
+        Ok(Self {
+            swapchain,
+            images,
+            extent: surface_caps.current_extent,
+            image_views,
+            core,
+            depth_image_view,
+            depth_image,
+        })
+    }
+}
+
+impl Drop for Swapchain {
+    fn drop(&mut self) {
+        unsafe {
+            self.core
+                .device
+                .destroy_swapchain_khr(Some(self.swapchain), None);
+            for view in self.image_views.drain(..) {
+            self.core
+                .device
+                .destroy_image_view(Some(view), None);
+            }
+        }
+        self.depth_image.free(&self.core);
+    }
 }
