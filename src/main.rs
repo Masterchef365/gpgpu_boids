@@ -18,6 +18,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 use std::ffi::CString;
+use gpu_alloc::UsageFlags;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new();
@@ -47,7 +48,8 @@ struct App {
 
 impl App {
     pub fn new(event_loop: &EventLoop<()>) -> Result<Self> {
-        let engine = Engine::new(event_loop, false)?;
+        let workgroups = 22;
+        let engine = Engine::new(event_loop, false, workgroups)?;
 
         Ok(Self { engine })
     }
@@ -65,6 +67,17 @@ const FRAMES_IN_FLIGHT: usize = 2;
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const BOID_LOCAL_X: u32 = 16;
+const BOID_SIZE: u32 = 4 * (3 + 1 + 3 + 1);
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SceneData {
+    pub cameras: [[[f32; 4]; 4]; 2],
+    pub frame: u32,
+}
+
+unsafe impl bytemuck::Pod for SceneData {}
+unsafe impl bytemuck::Zeroable for SceneData {}
 
 struct Engine {
     window: Window,
@@ -91,17 +104,17 @@ struct Engine {
 
     core: SharedCore,
 
-    /*
     scene_data: MemObject<vk::Buffer>,
 
     boid_buf_a: MemObject<vk::Buffer>,
     boid_buf_b: MemObject<vk::Buffer>,
     boid_buf_select: bool,
-    */
+
+    workgroups: u32,
 }
 
 impl Engine {
-    pub fn new(event_loop: &EventLoop<()>, vr: bool) -> Result<Self> {
+    pub fn new(event_loop: &EventLoop<()>, vr: bool, workgroups: u32) -> Result<Self> {
         // Windowing
         let window = WindowBuilder::new()
             .with_resizable(true)
@@ -369,11 +382,30 @@ impl Engine {
         }
         .result()?[0];
 
+        // Destroy unused modules
         unsafe {
-            for &m in &[boid_module, vertex_module, fragment_module] {
+            for &m in &[boid_module, boid_init_module, vertex_module, fragment_module] {
                 core.device.destroy_shader_module(Some(m), None);
             }
         }
+
+        let n_boids = workgroups * BOID_LOCAL_X;
+        let boid_storage_size = BOID_SIZE * n_boids;
+
+        let buffer_create_info = vk::BufferCreateInfoBuilder::new()
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .size(boid_storage_size as _)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let boid_buf_a = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
+        let boid_buf_b = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
+
+        let buffer_create_info = vk::BufferCreateInfoBuilder::new()
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .size(std::mem::size_of::<SceneData>() as _)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let scene_data = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::UPLOAD | UsageFlags::HOST_ACCESS)?;
 
         Ok(Self {
             core,
@@ -393,6 +425,11 @@ impl Engine {
             boid_pipeline,
             boid_init_pipeline,
             scene_pipeline,
+            workgroups,
+            boid_buf_a,
+            boid_buf_b,
+            scene_data,
+            boid_buf_select: false,
         })
     }
 }
