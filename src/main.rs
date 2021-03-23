@@ -83,7 +83,6 @@ impl App {
     }
 
     pub fn draw(&mut self) -> Result<()> {
-        let extent = self.engine.swapchain.extent;
         self.engine.draw(self.cam_matrix)
     }
 }
@@ -490,10 +489,7 @@ impl Engine {
     }
 
     fn write_boid_desc_set(&self) -> Result<()> {
-        let (read_buf, write_buf) = match self.boid_buf_select {
-            true => (self.boid_buf_a.instance, self.boid_buf_b.instance),
-            false => (self.boid_buf_b.instance, self.boid_buf_a.instance),
-        };
+        let (read_buf, write_buf) = self.boid_buffer_rw();
 
         unsafe {
             self.core.device.update_descriptor_sets(
@@ -521,11 +517,15 @@ impl Engine {
         Ok(())
     }
 
+    fn boid_buffer_rw(&self) -> (vk::Buffer, vk::Buffer) {
+        match self.boid_buf_select {
+            true => (self.boid_buf_a.instance, self.boid_buf_b.instance),
+            false => (self.boid_buf_b.instance, self.boid_buf_a.instance),
+        }
+    }
+
     fn write_scene_desc_set(&self) -> Result<()> {
-        let read_buf = match self.boid_buf_select {
-            true => self.boid_buf_a.instance,
-            false => self.boid_buf_b.instance,
-        };
+        let (read_buf, _) = self.boid_buffer_rw();
 
         unsafe {
             self.core.device.update_descriptor_sets(
@@ -614,7 +614,7 @@ impl Engine {
                 .device
                 .queue_wait_idle(self.core.graphics_queue)
                 .result()?;
-            }
+        }
 
         let data = SceneData {
             cameras: camera_matrices,
@@ -622,9 +622,10 @@ impl Engine {
         };
         unsafe {
             let device = EruptMemoryDevice::wrap(&self.core.device);
-            self.scene_data.memory_mut().write_bytes(device, 0, bytemuck::cast_slice(&[data]))?;
+            self.scene_data
+                .memory_mut()
+                .write_bytes(device, 0, bytemuck::cast_slice(&[data]))?;
         }
-
 
         // Get the index of the next swapchain image,
         // and set up a semaphore to be notified when it is ready.
@@ -653,7 +654,6 @@ impl Engine {
             swap_image_index.unwrap() as usize
         };
 
-        let swapchain_image = self.swapchain.images[image_index];
         let framebuffer = self.swapchain.framebuffers[image_index];
 
         // Update descriptor set to include the buffer
@@ -683,7 +683,7 @@ impl Engine {
                 &[],
             );
 
-            // Radiation pipeline
+            // Boid pipeline
             self.core.device.cmd_bind_pipeline(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -692,7 +692,26 @@ impl Engine {
 
             self.core
                 .device
-                .cmd_dispatch(self.command_buffer, BOID_LOCAL_X, 1, 1);
+                .cmd_dispatch(self.command_buffer, self.workgroups, 1, 1);
+
+            let (_, write_buf) = self.boid_buffer_rw();
+            let barrier = vk::BufferMemoryBarrierBuilder::new()
+                .buffer(write_buf)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+
+            self.core.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::VERTEX_SHADER,
+                None,
+                &[],
+                &[barrier],
+                &[],
+            );
+
 
             // ############################# GRAPHICS #############################
 
@@ -803,6 +822,7 @@ impl Engine {
                 .result()?;
         }
 
+        self.boid_buf_select = !self.boid_buf_select;
         self.frame += 1;
 
         Ok(())

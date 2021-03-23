@@ -28,6 +28,7 @@ void main() {
     if (gid >= read.length()) return;
 
     Boid boid = read[gid];
+    /*
     vec3 avg_off = vec3(0);
     vec3 avg_heading = vec3(0);
     float avg_dist = 0.;
@@ -70,6 +71,8 @@ void main() {
     } else {
         write[gid].heading = read[gid].heading;
     }
+    */
 
+    write[gid].heading = boid.heading;
     write[gid].pos = boid.pos + write[gid].heading * speed;
 }
