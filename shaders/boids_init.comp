@@ -1,0 +1,35 @@
+#version 450
+layout (local_size_x = 16) in;
+
+struct Boid {
+    vec3 pos;
+    uint _pad0;
+    vec3 heading;
+    uint _pad1;
+};
+
+layout(std430, binding = 0) buffer Boids {
+    Boid boids[];
+};
+
+const float spread = 10.0;
+
+float rand(vec2 co){
+    return fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43758.5453);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= boids.length()) return;
+    float seed = gid;
+    boids[gid].pos = vec3(
+        rand(vec2(seed, 342.)) * spread,
+        rand(vec2(seed, 432.)) * spread,
+        rand(vec2(seed, 121.)) * spread
+    );
+    boids[gid].heading = vec3(
+        rand(vec2(seed, 34.)),
+        rand(vec2(seed, 45.)),
+        rand(vec2(seed, 14.))
+    ) * 2. - 1.;
+}

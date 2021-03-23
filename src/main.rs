@@ -64,6 +64,7 @@ impl App {
 const FRAMES_IN_FLIGHT: usize = 2;
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+const BOID_LOCAL_X: u32 = 16;
 
 struct Engine {
     window: Window,
@@ -76,14 +77,9 @@ struct Engine {
     scene_desc_set: vk::DescriptorSet,
     boid_desc_set: vk::DescriptorSet,
 
-    //scene_data: MemObject<vk::Buffer>,
-
-    //boid_buf_a: MemObject<vk::Buffer>,
-    //boid_buf_b: MemObject<vk::Buffer>,
-    //boid_buf_select: bool,
-
     scene_pipeline: vk::Pipeline,
     boid_pipeline: vk::Pipeline,
+    boid_init_pipeline: vk::Pipeline,
 
     swapchain: SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
@@ -94,6 +90,14 @@ struct Engine {
     render_finished: vk::Semaphore,
 
     core: SharedCore,
+
+    /*
+    scene_data: MemObject<vk::Buffer>,
+
+    boid_buf_a: MemObject<vk::Buffer>,
+    boid_buf_b: MemObject<vk::Buffer>,
+    boid_buf_select: bool,
+    */
 }
 
 impl Engine {
@@ -221,17 +225,18 @@ impl Engine {
         };
 
         let boid_module = load_shader_module("./shaders/boids.comp.spv")?;
+        let boid_init_module = load_shader_module("./shaders/boids_init.comp.spv")?;
         let vertex_module = load_shader_module("./shaders/unlit.vert.spv")?;
         let fragment_module = load_shader_module("./shaders/unlit.frag.spv")?;
 
         // Build boid pipeline
+        let main_entry_point = CString::new("main")?;
         let descriptor_set_layouts = [boid_descriptor_set_layout];
         let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
             .set_layouts(&descriptor_set_layouts);
         let pipeline_layout =
             unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
 
-        let main_entry_point = CString::new("main")?;
         let stage = vk::PipelineShaderStageCreateInfoBuilder::new()
             .stage(vk::ShaderStageFlagBits::COMPUTE)
             .module(boid_module)
@@ -241,15 +246,32 @@ impl Engine {
             .stage(stage)
             .layout(pipeline_layout);
 
+        // Boid init pipeline
+        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
+            .set_layouts(&descriptor_set_layouts);
+        let pipeline_layout =
+            unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
+
+        let stage = vk::PipelineShaderStageCreateInfoBuilder::new()
+            .stage(vk::ShaderStageFlagBits::COMPUTE)
+            .module(boid_module)
+            .name(&main_entry_point)
+            .build();
+        let boid_init_create_info = vk::ComputePipelineCreateInfoBuilder::new()
+            .stage(stage)
+            .layout(pipeline_layout);
+
         // Make pipelines
-        let boid_pipeline = unsafe {
+        let boid_pipelines = unsafe {
             core.device.create_compute_pipelines(
                 None,
-                &[boid_create_info],
+                &[boid_create_info, boid_init_create_info],
                 None,
             )
         }
-        .result()?[0];
+        .result()?;
+        let boid_pipeline = boid_pipelines[0];
+        let boid_init_pipeline = boid_pipelines[1];
 
         // Create render pass
         let render_pass = create_render_pass(&core, vr)?;
@@ -369,6 +391,7 @@ impl Engine {
             image_available,
             render_finished,
             boid_pipeline,
+            boid_init_pipeline,
             scene_pipeline,
         })
     }
