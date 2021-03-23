@@ -59,11 +59,10 @@ impl App {
     }
 
     pub fn draw(&mut self) -> Result<()> {
-        Ok(())
+        self.engine.draw()
     }
 }
 
-const FRAMES_IN_FLIGHT: usize = 2;
 const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const BOID_LOCAL_X: u32 = 16;
@@ -90,7 +89,10 @@ struct Engine {
     scene_desc_set: vk::DescriptorSet,
     boid_desc_set: vk::DescriptorSet,
 
+    scene_pipeline_layout: vk::PipelineLayout,
     scene_pipeline: vk::Pipeline,
+
+    boid_pipeline_layout: vk::PipelineLayout,
     boid_pipeline: vk::Pipeline,
     boid_init_pipeline: vk::Pipeline,
 
@@ -102,8 +104,6 @@ struct Engine {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
 
-    core: SharedCore,
-
     scene_data: MemObject<vk::Buffer>,
 
     boid_buf_a: MemObject<vk::Buffer>,
@@ -111,6 +111,9 @@ struct Engine {
     boid_buf_select: bool,
 
     workgroups: u32,
+
+    core: SharedCore,
+
 }
 
 impl Engine {
@@ -247,7 +250,7 @@ impl Engine {
         let descriptor_set_layouts = [boid_descriptor_set_layout];
         let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
             .set_layouts(&descriptor_set_layouts);
-        let pipeline_layout =
+        let boid_pipeline_layout =
             unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
 
         let stage = vk::PipelineShaderStageCreateInfoBuilder::new()
@@ -257,22 +260,17 @@ impl Engine {
             .build();
         let boid_create_info = vk::ComputePipelineCreateInfoBuilder::new()
             .stage(stage)
-            .layout(pipeline_layout);
+            .layout(boid_pipeline_layout);
 
         // Boid init pipeline
-        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
-            .set_layouts(&descriptor_set_layouts);
-        let pipeline_layout =
-            unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
-
         let stage = vk::PipelineShaderStageCreateInfoBuilder::new()
             .stage(vk::ShaderStageFlagBits::COMPUTE)
-            .module(boid_module)
+            .module(boid_init_module)
             .name(&main_entry_point)
             .build();
         let boid_init_create_info = vk::ComputePipelineCreateInfoBuilder::new()
             .stage(stage)
-            .layout(pipeline_layout);
+            .layout(boid_pipeline_layout);
 
         // Make pipelines
         let boid_pipelines = unsafe {
@@ -343,7 +341,7 @@ impl Engine {
         let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
             .set_layouts(&descriptor_set_layouts);
 
-        let pipeline_layout = unsafe {
+        let scene_pipeline_layout = unsafe {
             core
                 .device
                 .create_pipeline_layout(&create_info, None, None)
@@ -371,7 +369,7 @@ impl Engine {
             .color_blend_state(&color_blending)
             .depth_stencil_state(&depth_stencil_state)
             .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
+            .layout(scene_pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
 
@@ -389,6 +387,7 @@ impl Engine {
             }
         }
 
+        // Create boid buffers
         let n_boids = workgroups * BOID_LOCAL_X;
         let boid_storage_size = BOID_SIZE * n_boids;
 
@@ -405,9 +404,10 @@ impl Engine {
             .size(std::mem::size_of::<SceneData>() as _)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
+        // Create scene data buffer
         let scene_data = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::UPLOAD | UsageFlags::HOST_ACCESS)?;
 
-        Ok(Self {
+        let mut instance = Self {
             core,
             window,
             surface,
@@ -429,8 +429,149 @@ impl Engine {
             boid_buf_a,
             boid_buf_b,
             scene_data,
+            scene_pipeline_layout,
+            boid_pipeline_layout,
             boid_buf_select: false,
-        })
+        };
+
+        instance.reset_boids()?;
+
+        Ok(instance)
+    }
+
+    fn write_boid_desc_set(&self) -> Result<()> {
+        let (read_buf, write_buf) = match self.boid_buf_select {
+            true => (self.boid_buf_a.instance, self.boid_buf_b.instance),
+            false => (self.boid_buf_b.instance, self.boid_buf_a.instance),
+        };
+
+        unsafe {
+            self.core.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSetBuilder::new()
+                        .dst_set(self.boid_desc_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                            .buffer(read_buf)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                    vk::WriteDescriptorSetBuilder::new()
+                        .dst_set(self.boid_desc_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                            .buffer(write_buf)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                ],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    fn write_scene_desc_set(&self) -> Result<()> {
+        let read_buf = match self.boid_buf_select {
+            true => self.boid_buf_a.instance,
+            false => self.boid_buf_b.instance,
+        };
+
+        unsafe {
+            self.core.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSetBuilder::new()
+                        .dst_set(self.scene_desc_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                            .buffer(self.scene_data.instance)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                    vk::WriteDescriptorSetBuilder::new()
+                        .dst_set(self.scene_desc_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&[vk::DescriptorBufferInfoBuilder::new()
+                            .buffer(read_buf)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                ],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    pub fn reset_boids(&mut self) -> Result<()> {
+        unsafe {
+            self.core.device.queue_wait_idle(self.core.graphics_queue);
+            self.write_boid_desc_set();
+            self.core
+                .device
+                .reset_command_buffer(self.command_buffer, None)
+                .result()?;
+            let begin_info = vk::CommandBufferBeginInfoBuilder::new();
+            self.core
+                .device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+                .result()?;
+
+            self.core.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.boid_pipeline_layout,
+                0,
+                &[self.boid_desc_set],
+                &[]
+            );
+
+            self.core.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.boid_init_pipeline,
+            );
+
+            self.core
+                .device
+                .cmd_dispatch(self.command_buffer, self.workgroups, 1, 1);
+
+            self.core
+                .device
+                .end_command_buffer(self.command_buffer)
+                .result()?;
+            let command_buffers = [self.command_buffer];
+            let submit_info = vk::SubmitInfoBuilder::new().command_buffers(&command_buffers);
+            self.core
+                .device
+                .queue_submit(self.core.graphics_queue, &[submit_info], None)
+                .result()?;
+            self.core.device.queue_wait_idle(self.core.graphics_queue).result()?;
+        }
+        Ok(())
+    }
+
+    pub fn draw(&mut self) -> Result<()> {
+        // Get the index of the next swapchain image,
+        // and set up a semaphore to be notified when it is ready.
+        let image_index = unsafe {
+            self.core.device.acquire_next_image_khr(
+                self.swapchain,
+                u64::MAX,
+                Some(self.image_available),
+                None,
+                None,
+            )
+        }
+        .result()?;
+
+        let swapchain_image = self.swapchain_images[image_index as usize];
+
+        // Update descriptor set to include the buffer
+        self.write_boid_desc_set()?;
+        self.write_scene_desc_set()?;
+
+        Ok(())
     }
 }
 
