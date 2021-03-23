@@ -1,15 +1,17 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use erupt::extensions::{
     khr_surface::{self, SurfaceKHR},
     khr_swapchain::{self, SwapchainKHR},
 };
 use erupt::utils::decode_spv;
 use erupt::vk;
+use gpu_alloc::UsageFlags;
 use klystron::{
     mem_objects::MemObject,
     windowed::{self, hardware::SurfaceInfo},
     ApplicationInfo, Core, HardwareSelection, Memory, SharedCore, VulkanSetup,
 };
+use std::ffi::CString;
 use wibaeowibtnr as klystron;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -17,8 +19,6 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
-use std::ffi::CString;
-use gpu_alloc::UsageFlags;
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new();
@@ -100,6 +100,7 @@ struct Engine {
     swapchain_images: Vec<vk::Image>,
     surface_info: SurfaceInfo,
     surface: SurfaceKHR,
+    extent: vk::Extent2D,
 
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
@@ -110,10 +111,12 @@ struct Engine {
     boid_buf_b: MemObject<vk::Buffer>,
     boid_buf_select: bool,
 
+    depth_image: MemObject<vk::Image>,
+    depth_image_view: vk::ImageView,
+
     workgroups: u32,
 
     core: SharedCore,
-
 }
 
 impl Engine {
@@ -134,7 +137,7 @@ impl Engine {
         let (surface, hardware, surface_info, core) =
             windowed::basics(&app_info, &mut setup, &window)?;
 
-        let (swapchain, swapchain_images) =
+        let (swapchain, swapchain_images, extent) =
             build_swapchain(&core, &hardware, surface, &surface_info)?;
 
         // Create command pool
@@ -199,11 +202,11 @@ impl Engine {
         // Pool
         let pool_sizes = [
             vk::DescriptorPoolSizeBuilder::new()
-            ._type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3),
+                ._type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(3),
             vk::DescriptorPoolSizeBuilder::new()
-            ._type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
+                ._type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1),
         ];
         let create_info = vk::DescriptorPoolCreateInfoBuilder::new()
             .pool_sizes(&pool_sizes)
@@ -222,7 +225,7 @@ impl Engine {
 
         let boid_desc_set = descriptor_sets[0];
         let scene_desc_set = descriptor_sets[1];
-        
+
         // Whether or not the frame at this index is available (gpu-only)
         let create_info = vk::SemaphoreCreateInfoBuilder::new();
         let image_available =
@@ -234,7 +237,8 @@ impl Engine {
 
         // Load shader source
         let load_shader_module = |name: &str| -> Result<vk::ShaderModule> {
-            let shader_spirv = std::fs::read(name).with_context(|| format!("Shader \"{}\" failed to load", name))?;
+            let shader_spirv = std::fs::read(name)
+                .with_context(|| format!("Shader \"{}\" failed to load", name))?;
             let shader_decoded = decode_spv(&shader_spirv).context("Shader decode failed")?;
             let create_info = vk::ShaderModuleCreateInfoBuilder::new().code(&shader_decoded);
             Ok(unsafe { core.device.create_shader_module(&create_info, None, None) }.result()?)
@@ -248,8 +252,8 @@ impl Engine {
         // Build boid pipeline
         let main_entry_point = CString::new("main")?;
         let descriptor_set_layouts = [boid_descriptor_set_layout];
-        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
-            .set_layouts(&descriptor_set_layouts);
+        let create_info =
+            vk::PipelineLayoutCreateInfoBuilder::new().set_layouts(&descriptor_set_layouts);
         let boid_pipeline_layout =
             unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
 
@@ -338,15 +342,11 @@ impl Engine {
 
         let descriptor_set_layouts = [scene_descriptor_set_layout];
 
-        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
-            .set_layouts(&descriptor_set_layouts);
+        let create_info =
+            vk::PipelineLayoutCreateInfoBuilder::new().set_layouts(&descriptor_set_layouts);
 
-        let scene_pipeline_layout = unsafe {
-            core
-                .device
-                .create_pipeline_layout(&create_info, None, None)
-        }
-        .result()?;
+        let scene_pipeline_layout =
+            unsafe { core.device.create_pipeline_layout(&create_info, None, None) }.result()?;
 
         let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfoBuilder::new()
             .depth_test_enable(true)
@@ -374,15 +374,19 @@ impl Engine {
             .subpass(0);
 
         let scene_pipeline = unsafe {
-            core
-                .device
+            core.device
                 .create_graphics_pipelines(None, &[scene_create_info], None)
         }
         .result()?[0];
 
         // Destroy unused modules
         unsafe {
-            for &m in &[boid_module, boid_init_module, vertex_module, fragment_module] {
+            for &m in &[
+                boid_module,
+                boid_init_module,
+                vertex_module,
+                fragment_module,
+            ] {
                 core.device.destroy_shader_module(Some(m), None);
             }
         }
@@ -396,8 +400,16 @@ impl Engine {
             .size(boid_storage_size as _)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let boid_buf_a = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
-        let boid_buf_b = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
+        let boid_buf_a = MemObject::<vk::Buffer>::new(
+            &core,
+            buffer_create_info,
+            UsageFlags::FAST_DEVICE_ACCESS,
+        )?;
+        let boid_buf_b = MemObject::<vk::Buffer>::new(
+            &core,
+            buffer_create_info,
+            UsageFlags::FAST_DEVICE_ACCESS,
+        )?;
 
         let buffer_create_info = vk::BufferCreateInfoBuilder::new()
             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -405,7 +417,49 @@ impl Engine {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         // Create scene data buffer
-        let scene_data = MemObject::<vk::Buffer>::new(&core, buffer_create_info, UsageFlags::UPLOAD | UsageFlags::HOST_ACCESS)?;
+        let scene_data = MemObject::<vk::Buffer>::new(
+            &core,
+            buffer_create_info,
+            UsageFlags::UPLOAD | UsageFlags::HOST_ACCESS,
+        )?;
+
+        // Create depth image
+        let layers = if vr { 2 } else { 1 };
+        let create_info = vk::ImageCreateInfoBuilder::new()
+            .image_type(vk::ImageType::_2D)
+            .extent(
+                vk::Extent3DBuilder::new()
+                    .width(extent.width)
+                    .height(extent.height)
+                    .depth(1)
+                    .build(),
+            )
+            .mip_levels(1)
+            .array_layers(layers)
+            .format(DEPTH_FORMAT)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .samples(vk::SampleCountFlagBits::_1)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let depth_image = MemObject::<vk::Image>::new(&core, create_info, UsageFlags::FAST_DEVICE_ACCESS)?;
+
+        let create_info = vk::ImageViewCreateInfoBuilder::new()
+            .image(depth_image.instance)
+            .view_type(vk::ImageViewType::_2D)
+            .format(DEPTH_FORMAT)
+            .subresource_range(
+                vk::ImageSubresourceRangeBuilder::new()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(layers)
+                    .build(),
+            );
+        let depth_image_view =
+            unsafe { core.device.create_image_view(&create_info, None, None) }.result()?;
 
         let mut instance = Self {
             core,
@@ -432,6 +486,9 @@ impl Engine {
             scene_pipeline_layout,
             boid_pipeline_layout,
             boid_buf_select: false,
+            extent,
+            depth_image,
+            depth_image_view,
         };
 
         instance.reset_boids()?;
@@ -505,8 +562,8 @@ impl Engine {
 
     pub fn reset_boids(&mut self) -> Result<()> {
         unsafe {
-            self.core.device.queue_wait_idle(self.core.graphics_queue);
-            self.write_boid_desc_set();
+            self.core.device.queue_wait_idle(self.core.graphics_queue).result()?;
+            self.write_boid_desc_set()?;
             self.core
                 .device
                 .reset_command_buffer(self.command_buffer, None)
@@ -523,7 +580,7 @@ impl Engine {
                 self.boid_pipeline_layout,
                 0,
                 &[self.boid_desc_set],
-                &[]
+                &[],
             );
 
             self.core.device.cmd_bind_pipeline(
@@ -546,7 +603,10 @@ impl Engine {
                 .device
                 .queue_submit(self.core.graphics_queue, &[submit_info], None)
                 .result()?;
-            self.core.device.queue_wait_idle(self.core.graphics_queue).result()?;
+            self.core
+                .device
+                .queue_wait_idle(self.core.graphics_queue)
+                .result()?;
         }
         Ok(())
     }
@@ -562,14 +622,53 @@ impl Engine {
                 None,
                 None,
             )
-        }
-        .result()?;
+        };
+
+        // Early return and invalidate swapchain
+        let image_index = if image_index.raw == vk::Result::ERROR_OUT_OF_DATE_KHR {
+            unsafe {
+                self.core
+                    .device
+                    .destroy_swapchain_khr(Some(self.swapchain), None);
+            }
+            let (swapchain, swapchain_images, extent) =
+                build_swapchain(&self.core, &self.hardware, self.surface, &self.surface_info)?;
+            self.swapchain = swapchain;
+            self.swapchain_images = swapchain_images;
+            self.extent = extent;
+            return Ok(());
+        } else {
+            image_index.unwrap()
+        };
 
         let swapchain_image = self.swapchain_images[image_index as usize];
 
         // Update descriptor set to include the buffer
         self.write_boid_desc_set()?;
         self.write_scene_desc_set()?;
+
+        unsafe {
+            self.core
+                .device
+                .reset_command_buffer(self.command_buffer, None)
+                .result()?;
+            let begin_info = vk::CommandBufferBeginInfoBuilder::new();
+            self.core
+                .device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+                .result()?;
+
+            self.core
+                .device
+                .end_command_buffer(self.command_buffer)
+                .result()?;
+            let command_buffers = [self.command_buffer];
+            let submit_info = vk::SubmitInfoBuilder::new().command_buffers(&command_buffers);
+            self.core
+                .device
+                .queue_submit(self.core.graphics_queue, &[submit_info], None)
+                .result()?;
+        }
 
         Ok(())
     }
@@ -586,7 +685,7 @@ fn build_swapchain(
     hardware: &HardwareSelection,
     surface: SurfaceKHR,
     surface_info: &SurfaceInfo,
-) -> Result<(SwapchainKHR, Vec<vk::Image>)> {
+) -> Result<(SwapchainKHR, Vec<vk::Image>, vk::Extent2D)> {
     // Create swapchain
     let surface_caps = unsafe {
         core.instance.get_physical_device_surface_capabilities_khr(
@@ -621,7 +720,7 @@ fn build_swapchain(
     let swapchain_images =
         unsafe { core.device.get_swapchain_images_khr(swapchain, None) }.result()?;
 
-    Ok((swapchain, swapchain_images))
+    Ok((swapchain, swapchain_images, surface_caps.current_extent))
 }
 
 fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
@@ -692,4 +791,3 @@ fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
 
     Ok(unsafe { device.create_render_pass(&create_info, None, None) }.result()?)
 }
-
