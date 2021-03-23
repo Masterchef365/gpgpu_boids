@@ -775,12 +775,6 @@ impl Engine {
                 .device
                 .end_command_buffer(self.command_buffer)
                 .result()?;
-            let command_buffers = [self.command_buffer];
-            let submit_info = vk::SubmitInfoBuilder::new().command_buffers(&command_buffers);
-            self.core
-                .device
-                .queue_submit(self.core.graphics_queue, &[submit_info], None)
-                .result()?;
 
             // Present
             let wait_semaphores = [self.image_available];
