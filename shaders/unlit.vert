@@ -1,27 +1,35 @@
-
 #version 450
-#extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_multiview : require
 
-layout(binding = 0) uniform CameraUbo {
+struct Boid {
+    vec3 position;
+    float unused0;
+    vec3 heading;
+    float unused1;
+};
+
+layout(binding = 0) uniform Scene {
     mat4 camera[2];
+    uint frame_idx;
 };
 
-layout(binding = 1) uniform Animation {
-    float anim;
+layout(std430, binding = 1) buffer Boids {
+    Boid boids[];
 };
-
-layout(push_constant) uniform Model {
-    mat4 model;
-};
-
-layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inColor;
 
 layout(location = 0) out vec3 fragColor;
 
 void main() {
-    gl_Position = camera[gl_ViewIndex] * model * vec4(inPosition, 1.0);
-    fragColor = inColor;
-}
+    uint boid_idx = gl_VertexIndex / 2;
+    Boid boid = boids[boid_idx];
 
+    vec3 pos;
+    if ((gl_VertexIndex & 1) == 0) {
+        pos = boid.position;
+    } else {
+        pos = boid.position + boid.heading;
+    }
+
+    gl_Position = camera[gl_ViewIndex] * vec4(pos, 1.0);
+    fragColor = boid.heading;
+}

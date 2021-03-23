@@ -47,7 +47,7 @@ struct App {
 
 impl App {
     pub fn new(event_loop: &EventLoop<()>) -> Result<Self> {
-        let engine = Engine::new(event_loop)?;
+        let engine = Engine::new(event_loop, false)?;
 
         Ok(Self { engine })
     }
@@ -61,7 +61,10 @@ impl App {
     }
 }
 
-const FRAMES_IN_FLIGHT: u32 = 2;
+const FRAMES_IN_FLIGHT: usize = 2;
+const COLOR_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
+const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
 struct Engine {
     window: Window,
     hardware: HardwareSelection,
@@ -79,7 +82,7 @@ struct Engine {
     //boid_buf_b: MemObject<vk::Buffer>,
     //boid_buf_select: bool,
 
-    //scene_pipeline: vk::Pipeline,
+    scene_pipeline: vk::Pipeline,
     boid_pipeline: vk::Pipeline,
 
     swapchain: SwapchainKHR,
@@ -94,7 +97,7 @@ struct Engine {
 }
 
 impl Engine {
-    pub fn new(event_loop: &EventLoop<()>) -> Result<Self> {
+    pub fn new(event_loop: &EventLoop<()>, vr: bool) -> Result<Self> {
         // Windowing
         let window = WindowBuilder::new()
             .with_resizable(true)
@@ -162,7 +165,7 @@ impl Engine {
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
         ];
 
         let create_info = vk::DescriptorSetLayoutCreateInfoBuilder::new().bindings(&bindings);
@@ -184,7 +187,7 @@ impl Engine {
         ];
         let create_info = vk::DescriptorPoolCreateInfoBuilder::new()
             .pool_sizes(&pool_sizes)
-            .max_sets(FRAMES_IN_FLIGHT * 2);
+            .max_sets(2);
         let descriptor_pool =
             unsafe { core.device.create_descriptor_pool(&create_info, None, None) }.result()?;
 
@@ -222,6 +225,7 @@ impl Engine {
         let fragment_module = load_shader_module("./shaders/unlit.frag.spv")?;
 
         // Build boid pipeline
+        let descriptor_set_layouts = [boid_descriptor_set_layout];
         let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
             .set_layouts(&descriptor_set_layouts);
         let pipeline_layout =
@@ -237,16 +241,111 @@ impl Engine {
             .stage(stage)
             .layout(pipeline_layout);
 
-        let pipelines = unsafe {
+        // Make pipelines
+        let boid_pipeline = unsafe {
             core.device.create_compute_pipelines(
                 None,
                 &[boid_create_info],
                 None,
             )
         }
+        .result()?[0];
+
+        // Create render pass
+        let render_pass = create_render_pass(&core, vr)?;
+
+        // Build scene pipeline
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfoBuilder::new()
+            .topology(vk::PrimitiveTopology::LINE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewport_state = vk::PipelineViewportStateCreateInfoBuilder::new()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfoBuilder::new().dynamic_states(&dynamic_states);
+
+        let rasterizer = vk::PipelineRasterizationStateCreateInfoBuilder::new()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_clamp_enable(false);
+
+        let multisampling = vk::PipelineMultisampleStateCreateInfoBuilder::new()
+            .sample_shading_enable(false)
+            .rasterization_samples(vk::SampleCountFlagBits::_1);
+
+        let color_blend_attachments = [vk::PipelineColorBlendAttachmentStateBuilder::new()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .blend_enable(false)];
+        let color_blending = vk::PipelineColorBlendStateCreateInfoBuilder::new()
+            .logic_op_enable(false)
+            .attachments(&color_blend_attachments);
+
+        let shader_stages = [
+            vk::PipelineShaderStageCreateInfoBuilder::new()
+                .stage(vk::ShaderStageFlagBits::VERTEX)
+                .module(vertex_module)
+                .name(&main_entry_point),
+            vk::PipelineShaderStageCreateInfoBuilder::new()
+                .stage(vk::ShaderStageFlagBits::FRAGMENT)
+                .module(fragment_module)
+                .name(&main_entry_point),
+        ];
+
+        let descriptor_set_layouts = [scene_descriptor_set_layout];
+
+        let create_info = vk::PipelineLayoutCreateInfoBuilder::new()
+            .set_layouts(&descriptor_set_layouts);
+
+        let pipeline_layout = unsafe {
+            core
+                .device
+                .create_pipeline_layout(&create_info, None, None)
+        }
         .result()?;
 
-        let boid_pipeline = pipelines[0];
+        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfoBuilder::new()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS) // TODO: Play with this! For fun!
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfoBuilder::new()
+            .vertex_binding_descriptions(&[])
+            .vertex_attribute_descriptions(&[]);
+
+        let scene_create_info = vk::GraphicsPipelineCreateInfoBuilder::new()
+            .stages(&shader_stages)
+            .input_assembly_state(&input_assembly)
+            .vertex_input_state(&vertex_input)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .depth_stencil_state(&depth_stencil_state)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let scene_pipeline = unsafe {
+            core
+                .device
+                .create_graphics_pipelines(None, &[scene_create_info], None)
+        }
+        .result()?[0];
 
         unsafe {
             for &m in &[boid_module, vertex_module, fragment_module] {
@@ -270,7 +369,14 @@ impl Engine {
             image_available,
             render_finished,
             boid_pipeline,
+            scene_pipeline,
         })
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        todo!("Dealloc")
     }
 }
 
@@ -316,3 +422,73 @@ fn build_swapchain(
 
     Ok((swapchain, swapchain_images))
 }
+
+fn create_render_pass(core: &Core, vr: bool) -> Result<vk::RenderPass> {
+    let device = &core.device;
+
+    // Render pass
+    let color_attachment = vk::AttachmentDescriptionBuilder::new()
+        .format(COLOR_FORMAT)
+        .samples(vk::SampleCountFlagBits::_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(if vr {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        });
+
+    let depth_attachment = vk::AttachmentDescriptionBuilder::new()
+        .format(DEPTH_FORMAT)
+        .samples(vk::SampleCountFlagBits::_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+    let attachments = [color_attachment, depth_attachment];
+
+    let color_attachment_refs = [vk::AttachmentReferenceBuilder::new()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+    let depth_attachment_ref = vk::AttachmentReferenceBuilder::new()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .build();
+
+    let subpasses = [vk::SubpassDescriptionBuilder::new()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_attachment_refs)
+        .depth_stencil_attachment(&depth_attachment_ref)];
+
+    let dependencies = [vk::SubpassDependencyBuilder::new()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+
+    let mut create_info = vk::RenderPassCreateInfoBuilder::new()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+
+    let views = if vr { 2 } else { 1 };
+    let view_mask = [!(!0 << views)];
+    let mut multiview = vk::RenderPassMultiviewCreateInfoBuilder::new()
+        .view_masks(&view_mask)
+        .correlation_masks(&view_mask)
+        .build();
+
+    create_info.p_next = &mut multiview as *mut _ as _;
+
+    Ok(unsafe { device.create_render_pass(&create_info, None, None) }.result()?)
+}
+

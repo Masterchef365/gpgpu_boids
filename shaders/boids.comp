@@ -3,9 +3,9 @@ layout (local_size_x = 16) in;
 
 struct Boid {
     vec3 pos;
-    uint unused0;
+    uint _pad0;
     vec3 heading;
-    uint unused1;
+    uint _pad1;
 };
 
 layout(std430, binding = 0) readonly buffer Read {
@@ -16,14 +16,12 @@ layout(std430, binding = 1) buffer Write {
     Boid write[];
 };
 
-layout(std430, push_constant) uniform Params {
-    uint downsample;
-    float speed; // 0.004
-    float dist_thresh; // 5.0
-    float cohere; // 0.5
-    float steer; // 0.12
-    float parallel; // 0.12
-};
+const uint downsample = 4;
+const float speed = 0.04;
+const float dist_thresh = 5.;
+const float cohere = 0.5;
+const float steer = 0.2;
+const float parallel = 0.2;
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -75,5 +73,3 @@ void main() {
 
     write[gid].pos = boid.pos + write[gid].heading * speed;
 }
-
-
