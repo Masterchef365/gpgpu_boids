@@ -7,7 +7,8 @@ edition = "2018"
 [dependencies]
 erupt = "0.17"
 anyhow = "1"
-wibaeowibtnr = { path = "../wibaeowibtnr" }
+#wibaeowibtnr = { path = "../wibaeowibtnr" }
+wibaeowibtnr = { git = "https://github.com/Masterchef365/klystron2.git", branch = "main" }
 gpu-alloc-erupt = "0.3"
 gpu-alloc = "0.3"
 rand = "0.8"

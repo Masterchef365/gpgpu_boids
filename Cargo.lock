@@ -1202,6 +1202,7 @@ dependencies = [
 [[package]]
 name = "wibaeowibtnr"
 version = "0.1.0"
+source = "git+https://github.com/Masterchef365/klystron2.git?branch=main#bd514f21bbfe215fb84e178d01977504829cffd9"
 dependencies = [
  "anyhow",
  "bytemuck",
